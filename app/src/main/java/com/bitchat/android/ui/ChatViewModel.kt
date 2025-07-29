@@ -1,18 +1,19 @@
 package com.bitchat.android.ui
 
 import android.app.Application
-import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
 import com.bitchat.android.mesh.BluetoothMeshDelegate
 import com.bitchat.android.mesh.BluetoothMeshService
 import com.bitchat.android.model.BitchatMessage
 import com.bitchat.android.model.DeliveryAck
 import com.bitchat.android.model.ReadReceipt
-import kotlinx.coroutines.launch
+import com.permissionlesstech.bitchat.MeshtasticBluetoothConnector
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.*
 import kotlin.random.Random
 
@@ -25,27 +26,34 @@ class ChatViewModel(
     val meshService: BluetoothMeshService
 ) : AndroidViewModel(application), BluetoothMeshDelegate {
 
+    // Meshtastic Bluetooth integration
+    private val meshtasticConnector = MeshtasticBluetoothConnector()
+
+    // LiveData para mensajes recibidos desde Meshtastic
+    private val _meshtasticMessages = MutableLiveData<List<String>>(emptyList())
+    val meshtasticMessages: LiveData<List<String>> = _meshtasticMessages
+
     // State management
     private val state = ChatState()
-    
+
     // Specialized managers
     private val dataManager = DataManager(application.applicationContext)
     private val messageManager = MessageManager(state)
     private val channelManager = ChannelManager(state, messageManager, dataManager, viewModelScope)
-    
+
     // Create Noise session delegate for clean dependency injection
     private val noiseSessionDelegate = object : NoiseSessionDelegate {
         override fun hasEstablishedSession(peerID: String): Boolean = meshService.hasEstablishedSession(peerID)
-        override fun initiateHandshake(peerID: String) = meshService.initiateNoiseHandshake(peerID) 
+        override fun initiateHandshake(peerID: String) = meshService.initiateNoiseHandshake(peerID)
         override fun sendIdentityAnnouncement() = meshService.sendKeyExchangeToDevice()
         override fun sendHandshakeRequest(targetPeerID: String, pendingCount: UByte) = meshService.sendHandshakeRequest(targetPeerID, pendingCount)
         override fun getMyPeerID(): String = meshService.myPeerID
     }
-    
+
     val privateChatManager = PrivateChatManager(state, messageManager, dataManager, noiseSessionDelegate)
     private val commandProcessor = CommandProcessor(state, messageManager, channelManager, privateChatManager)
     private val notificationManager = NotificationManager(application.applicationContext)
-    
+
     // Delegate handler for mesh callbacks
     private val meshDelegateHandler = MeshDelegateHandler(
         state = state,
@@ -58,7 +66,7 @@ class ChatViewModel(
         getMyPeerID = { meshService.myPeerID },
         getMeshService = { meshService }
     )
-    
+
     // Expose state through LiveData (maintaining the same interface)
     val messages: LiveData<List<BitchatMessage>> = state.messages
     val connectedPeers: LiveData<List<String>> = state.connectedPeers
@@ -83,22 +91,29 @@ class ChatViewModel(
     val peerSessionStates: LiveData<Map<String, String>> = state.peerSessionStates
     val peerFingerprints: LiveData<Map<String, String>> = state.peerFingerprints
     val showAppInfo: LiveData<Boolean> = state.showAppInfo
-    
+
     init {
-        // Note: Mesh service delegate is now set by MainActivity
+        // Inicializar conexión Meshtastic Bluetooth
+        meshtasticConnector.onMessageReceived = { msg ->
+            val current = _meshtasticMessages.value ?: emptyList()
+            _meshtasticMessages.postValue(current + msg)
+        }
+        meshtasticConnector.connect()
+
+        // Carga e inicialización general
         loadAndInitialize()
     }
-    
+
     private fun loadAndInitialize() {
         // Load nickname
         val nickname = dataManager.loadNickname()
         state.setNickname(nickname)
-        
+
         // Load data
         val (joinedChannels, protectedChannels) = channelManager.loadChannelData()
         state.setJoinedChannels(joinedChannels)
         state.setPasswordProtectedChannels(protectedChannels)
-        
+
         // Initialize channel messages
         joinedChannels.forEach { channel ->
             if (!state.getChannelMessagesValue().containsKey(channel)) {
@@ -107,21 +122,19 @@ class ChatViewModel(
                 state.setChannelMessages(updatedChannelMessages)
             }
         }
-        
+
         // Load other data
         dataManager.loadFavorites()
         state.setFavoritePeers(dataManager.favoritePeers)
         dataManager.loadBlockedUsers()
-        
+
         // Log all favorites at startup
         dataManager.logAllFavorites()
         logCurrentFavoriteState()
-        
+
         // Initialize session state monitoring
         initializeSessionStateMonitoring()
-        
-        // Note: Mesh service is now started by MainActivity
-        
+
         // Show welcome message if no peers after delay
         viewModelScope.launch {
             delay(10000)
@@ -136,18 +149,131 @@ class ChatViewModel(
             }
         }
     }
-    
+
     override fun onCleared() {
         super.onCleared()
-        // Note: Mesh service lifecycle is now managed by MainActivity
+        meshtasticConnector.close()
+        // Note: Mesh service lifecycle is managed by MainActivity
     }
-    
+
     // MARK: - Nickname Management
-    
+
     fun setNickname(newNickname: String) {
         state.setNickname(newNickname)
         dataManager.saveNickname(newNickname)
         meshService.sendBroadcastAnnounce()
+    }
+
+    // MARK: - Channel Management (delegated)
+
+    fun joinChannel(channel: String, password: String? = null): Boolean {
+        return channelManager.joinChannel(channel, password, meshService.myPeerID)
+    }
+
+    fun switchToChannel(channel: String?) {
+        channelManager.switchToChannel(channel)
+    }
+
+    fun leaveChannel(channel: String) {
+        channelManager.leaveChannel(channel)
+        meshService.sendMessage("left $channel")
+    }
+
+    // MARK: - Private Chat Management (delegated)
+
+    fun startPrivateChat(peerID: String) {
+        val success = privateChatManager.startPrivateChat(peerID, meshService)
+        if (success) {
+            setCurrentPrivateChatPeer(peerID)
+            clearNotificationsForSender(peerID)
+        }
+    }
+
+    fun endPrivateChat() {
+        privateChatManager.endPrivateChat()
+        setCurrentPrivateChatPeer(null)
+    }
+
+    // MARK: - Message Sending
+
+    fun sendMessage(content: String) {
+        if (content.isEmpty()) return
+
+        // Enviar también a Meshtastic Bluetooth
+        sendMeshtasticMessage(content)
+
+        // Check for commands
+        if (content.startsWith("/")) {
+            commandProcessor.processCommand(content, meshService, meshService.myPeerID) { messageContent, mentions, channel ->
+                meshService.sendMessage(messageContent, mentions, channel)
+            }
+            return
+        }
+
+        val mentions = messageManager.parseMentions(content, meshService.getPeerNicknames().values.toSet(), state.getNicknameValue())
+        val channels = messageManager.parseChannels(content)
+
+        channels.forEach { channel ->
+            if (!state.getJoinedChannelsValue().contains(channel)) {
+                joinChannel(channel)
+            }
+        }
+
+        val selectedPeer = state.getSelectedPrivateChatPeerValue()
+        val currentChannelValue = state.getCurrentChannelValue()
+
+        if (selectedPeer != null) {
+            val recipientNickname = meshService.getPeerNicknames()[selectedPeer]
+            privateChatManager.sendPrivateMessage(
+                content,
+                selectedPeer,
+                recipientNickname,
+                state.getNicknameValue(),
+                meshService.myPeerID
+            ) { messageContent, peerID, recipientNicknameParam, messageId ->
+                meshService.sendPrivateMessage(messageContent, peerID, recipientNicknameParam, messageId)
+            }
+        } else {
+            val message = BitchatMessage(
+                sender = state.getNicknameValue() ?: meshService.myPeerID,
+                content = content,
+                timestamp = Date(),
+                isRelay = false,
+                senderPeerID = meshService.myPeerID,
+                mentions = if (mentions.isNotEmpty()) mentions else null,
+                channel = currentChannelValue
+            )
+
+            if (currentChannelValue != null) {
+                channelManager.addChannelMessage(currentChannelValue, message, meshService.myPeerID)
+
+                if (channelManager.hasChannelKey(currentChannelValue)) {
+                    channelManager.sendEncryptedChannelMessage(
+                        content,
+                        mentions,
+                        currentChannelValue,
+                        state.getNicknameValue(),
+                        meshService.myPeerID,
+                        onEncryptedPayload = { encryptedData ->
+                            meshService.sendMessage(content, mentions, currentChannelValue)
+                        },
+                        onFallback = {
+                            meshService.sendMessage(content, mentions, currentChannelValue)
+                        }
+                    )
+                } else {
+                    meshService.sendMessage(content, mentions, currentChannelValue)
+                }
+            } else {
+                messageManager.addMessage(message)
+                meshService.sendMessage(content, mentions, null)
+            }
+        }
+    }
+
+    // Envía mensaje a Meshtastic vía Bluetooth
+    fun sendMeshtasticMessage(msg: String) {
+        meshtasticConnector.sendMessage(msg)
     }
     
     // MARK: - Channel Management (delegated)

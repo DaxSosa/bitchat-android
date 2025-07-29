@@ -1,4 +1,4 @@
-<b>I used AI to do this experiment, I'm learning</>
+<b >align="center "I used AI to do this experiment, I'm learning"</b>
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/188c42f8-d249-4a72-b27a-e2b4f10a00a8" alt="Bitchat Android Logo" width="480">

@@ -52,78 +52,86 @@ import java.util.*
 fun ChatScreen(viewModel: ChatViewModel) {
     val colorScheme = MaterialTheme.colorScheme
     val messages by viewModel.messages.observeAsState(emptyList())
+    val meshtasticMessages by viewModel.meshtasticMessages.observeAsState(emptyList())
+
     val connectedPeers by viewModel.connectedPeers.observeAsState(emptyList())
     val nickname by viewModel.nickname.observeAsState("")
     val selectedPrivatePeer by viewModel.selectedPrivateChatPeer.observeAsState()
     val currentChannel by viewModel.currentChannel.observeAsState()
     val joinedChannels by viewModel.joinedChannels.observeAsState(emptySet())
-    val hasUnreadChannels by viewModel.unreadChannelMessages.observeAsState(emptyMap())
-    val hasUnreadPrivateMessages by viewModel.unreadPrivateMessages.observeAsState(emptySet())
+    val unreadChannelMessages by viewModel.unreadChannelMessages.observeAsState(emptyMap())
+    val unreadPrivateMessages by viewModel.unreadPrivateMessages.observeAsState(emptySet())
     val privateChats by viewModel.privateChats.observeAsState(emptyMap())
     val channelMessages by viewModel.channelMessages.observeAsState(emptyMap())
     val showSidebar by viewModel.showSidebar.observeAsState(false)
     val showCommandSuggestions by viewModel.showCommandSuggestions.observeAsState(false)
     val commandSuggestions by viewModel.commandSuggestions.observeAsState(emptyList())
     val showAppInfo by viewModel.showAppInfo.observeAsState(false)
-    
+
     var messageText by remember { mutableStateOf(TextFieldValue("")) }
     var showPasswordPrompt by remember { mutableStateOf(false) }
     var showPasswordDialog by remember { mutableStateOf(false) }
     var passwordInput by remember { mutableStateOf("") }
-    
-    // Show password dialog when needed
+
     LaunchedEffect(showPasswordPrompt) {
         showPasswordDialog = showPasswordPrompt
     }
-    
+
     val isConnected by viewModel.isConnected.observeAsState(false)
     val passwordPromptChannel by viewModel.passwordPromptChannel.observeAsState(null)
-    
-    // Determine what messages to show
+
+    // Convertir mensajes Meshtastic a BitchatMessage para mezclar
+    val allMeshtasticMessages = meshtasticMessages.map { msg ->
+        BitchatMessage(
+            id = java.util.UUID.randomUUID().toString(),
+            text = msg,
+            sender = "Meshtastic",
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    // Determinar qué mensajes mostrar según contexto (chat privado, canal o general)
     val displayMessages = when {
         selectedPrivatePeer != null -> privateChats[selectedPrivatePeer] ?: emptyList()
         currentChannel != null -> channelMessages[currentChannel] ?: emptyList()
-        else -> messages
+        else -> messages + allMeshtasticMessages
     }
-    
-    // Use WindowInsets to handle keyboard properly
+
     Box(modifier = Modifier.fillMaxSize()) {
         val headerHeight = 36.dp
-        
-        // Main content area that responds to keyboard/window insets
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(colorScheme.background)
-                .windowInsetsPadding(WindowInsets.ime) // This handles keyboard insets
+                .windowInsetsPadding(WindowInsets.ime)
         ) {
-            // Header spacer - creates space for the floating header
             Spacer(modifier = Modifier.height(headerHeight))
-            
-            // Messages area - takes up available space, will compress when keyboard appears
+
             MessagesList(
                 messages = displayMessages,
                 currentUserNickname = nickname,
                 meshService = viewModel.meshService,
                 modifier = Modifier.weight(1f)
             )
-            
-            // Input area - stays at bottom
+
             ChatInputSection(
                 messageText = messageText,
-                onMessageTextChange = { newText: TextFieldValue ->
+                onMessageTextChange = { newText ->
                     messageText = newText
                     viewModel.updateCommandSuggestions(newText.text)
                 },
                 onSend = {
-                    if (messageText.text.trim().isNotEmpty()) {
-                        viewModel.sendMessage(messageText.text.trim())
+                    val text = messageText.text.trim()
+                    if (text.isNotEmpty()) {
+                        viewModel.sendMessage(text)
+                        viewModel.sendMeshtasticMessage(text) // Enviar también a Meshtastic
                         messageText = TextFieldValue("")
                     }
                 },
                 showCommandSuggestions = showCommandSuggestions,
                 commandSuggestions = commandSuggestions,
-                onSuggestionClick = { suggestion: CommandSuggestion ->
+                onSuggestionClick = { suggestion ->
                     val commandText = viewModel.selectCommandSuggestion(suggestion)
                     messageText = TextFieldValue(
                         text = commandText,
@@ -136,6 +144,98 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 colorScheme = colorScheme
             )
         }
+
+        ChatFloatingHeader(
+            headerHeight = headerHeight,
+            selectedPrivatePeer = selectedPrivatePeer,
+            currentChannel = currentChannel,
+            nickname = nickname,
+            viewModel = viewModel,
+            colorScheme = colorScheme,
+            onSidebarToggle = { viewModel.showSidebar() },
+            onShowAppInfo = { viewModel.showAppInfo() },
+            onPanicClear = { viewModel.panicClearAllData() }
+        )
+
+        AnimatedVisibility(
+            visible = showSidebar,
+            enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
+            exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut(),
+            modifier = Modifier.zIndex(2f)
+        ) {
+            SidebarOverlay(
+                viewModel = viewModel,
+                onDismiss = { viewModel.hideSidebar() },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+
+    ChatDialogs(
+        showPasswordDialog = showPasswordDialog,
+        passwordPromptChannel = passwordPromptChannel,
+        passwordInput = passwordInput,
+        onPasswordChange = { passwordInput = it },
+        onPasswordConfirm = {
+            if (passwordInput.isNotEmpty()) {
+                val success = viewModel.joinChannel(passwordPromptChannel!!, passwordInput)
+                if (success) {
+                    showPasswordDialog = false
+                    passwordInput = ""
+                }
+            }
+        },
+        onPasswordDismiss = {
+            showPasswordDialog = false
+            passwordInput = ""
+        },
+        showAppInfo = showAppInfo,
+        onAppInfoDismiss = { viewModel.hideAppInfo() }
+    )
+}
+
+@Composable
+private fun ChatInputSection(
+    messageText: TextFieldValue,
+    onMessageTextChange: (TextFieldValue) -> Unit,
+    onSend: () -> Unit,
+    showCommandSuggestions: Boolean,
+    commandSuggestions: List<CommandSuggestion>,
+    onSuggestionClick: (CommandSuggestion) -> Unit,
+    selectedPrivatePeer: String?,
+    currentChannel: String?,
+    nickname: String,
+    colorScheme: ColorScheme
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = colorScheme.background,
+        shadowElevation = 8.dp
+    ) {
+        Column {
+            Divider(color = colorScheme.outline.copy(alpha = 0.3f))
+
+            if (showCommandSuggestions && commandSuggestions.isNotEmpty()) {
+                CommandSuggestionsBox(
+                    suggestions = commandSuggestions,
+                    onSuggestionClick = onSuggestionClick,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Divider(color = colorScheme.outline.copy(alpha = 0.2f))
+            }
+
+            MessageInput(
+                value = messageText,
+                onValueChange = onMessageTextChange,
+                onSend = onSend,
+                selectedPrivatePeer = selectedPrivatePeer,
+                currentChannel = currentChannel,
+                nickname = nickname,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
         
         // Floating header - positioned absolutely at top, ignores keyboard
         ChatFloatingHeader(
